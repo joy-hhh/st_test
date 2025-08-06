@@ -75,12 +75,10 @@ print(merged.head())
 
 
 ## footnote 대사 확인
-import pandas as pd
-
-
 # 주석과 재무제표 로드
 footnote_df = pd.read_excel("footnote.xlsx", dtype={"계정코드": str})
-footnote_s_df = pd.read_excel("footnote_s.xlsx", dtype={"계정코드": str})
+footnote_s1_df = pd.read_excel("footnote_s1.xlsx", dtype={"계정코드": str})
+footnote_s2_df = pd.read_excel("footnote_s2.xlsx", dtype={"계정코드": str})
 
 
 bspl_df = pd.read_excel("bspl.xlsx", dtype={"계정코드": str})
@@ -158,8 +156,6 @@ for file in uploaded_files:
     
     
 
-
-import pandas as pd
 
 def clean_footnote(df):
     """

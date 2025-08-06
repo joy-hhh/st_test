@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import io
 
-st.set_page_config(page_title="연결 재무제표 자동 집계", layout="wide")
+st.set_page_config(page_title="연결 재무제표 도우미", layout="wide")
 st.title("📊 연결 재무제표 집계 자동화")
 
 # ------------------------------
@@ -22,6 +22,7 @@ def load_excel(file, name):
     if "계정코드" not in df.columns or "금액" not in df.columns:
         st.error(f"[{name}] 파일에는 반드시 '계정코드'와 '금액' 열이 있어야 합니다.")
     return df
+
 
 def insert_group_totals_below(df, group_col, label_col_name, value_col="조정금액"):
     grouped = []
@@ -52,7 +53,7 @@ if coa_file and bspl_file:
 
     # 계정코드 기준 병합
     merged = coa_df.copy()
-    merged = coa_df.iloc[:, [1, 2]]
+
     merged = merged.merge(bspl_df[["계정코드", "금액"]], on="계정코드", how="left").rename(columns={"금액": "모회사"})
 
     for i, df in enumerate(bspl_s_dfs):
