@@ -2,26 +2,7 @@ import pandas as pd
 from openpyxl import Workbook
 
 
-
-# # 조정유형 리스트 정의 (코드 포함)
-# adjustment_types = [
-#     {"유형코드": "CAJE01", "조정유형": "Intercompany Elimination", "한글설명": "채권채무 제거"},
-#     {"유형코드": "CAJE02", "조정유형": "Unrealized Profit Elimination", "한글설명": "내부미실현이익 제거"},
-#     {"유형코드": "CAJE03", "조정유형": "Investment-Equity Elimination", "한글설명": "투자자본 상계"},
-#     {"유형코드": "CAJE04", "조정유형": "Dividend Adjustment", "한글설명": "배당 조정"},
-#     {"유형코드": "CAJE05", "조정유형": "Depreciation Adjustment", "한글설명": "감가상각 조정"},
-#     {"유형코드": "CAJE06", "조정유형": "Amortization Adjustment", "한글설명": "상각비 조정"},
-#     {"유형코드": "CAJE07", "조정유형": "Profit & Loss Adjustment", "한글설명": "손익 조정"},
-#     {"유형코드": "CAJE08", "조정유형": "Accounting Policy Adjustment", "한글설명": "회계정책 조정"},
-#     {"유형코드": "CAJE09", "조정유형": "Equity Method Adjustment", "한글설명": "지분법 조정"},
-#     {"유형코드": "CAJE10", "조정유형": "Fair Value Adjustment", "한글설명": "공정가치 조정"},
-#     {"유형코드": "CAJE99", "조정유형": "Other Adjustment", "한글설명": "기타 조정"},
-# ]
-
-# # DataFrame 생성
-# df_caje_types = pd.DataFrame(adjustment_types)
-
-
+# 엑셀 템플릿 다운로드
 # 조정유형 정의
 adjustment_types = [
     ("CAJE01_채권채무제거", "Intercompany Elimination"),
@@ -47,8 +28,7 @@ with pd.ExcelWriter("조정분개_입력템플릿.xlsx", engine="openpyxl") as w
         df.to_excel(writer, sheet_name=sheet_name, index=False)
 
 
-
-
+# 입력한 조정분개_입력템플릿 업로드 - 조정분개 산출 기능
 def get_fs_sign(fs_element):
     """FS_Element에 따라 금액 부호 결정"""
     if fs_element in ["A", "X"]:

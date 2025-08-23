@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
+import os
 from pathlib import Path
 from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
@@ -59,11 +60,7 @@ def to_excel(df_dict):
         for sheet_name, df in df_dict.items():
             if df is None or df.empty:
                 continue
-
-            # 소계 행 정보 추출 후, 'is_subtotal' 열은 엑셀에서 제외
-            is_subtotal_col = df['is_subtotal'] if 'is_subtotal' in df.columns else None
-            df_to_write = df.drop(columns=['is_subtotal']) if is_subtotal_col is not None else df
-            df_to_write.to_excel(writer, sheet_name=sheet_name, index=False)
+            df.to_excel(writer, sheet_name=sheet_name, index=False)
             
             ws = writer.sheets[sheet_name]
 
@@ -78,21 +75,12 @@ def to_excel(df_dict):
                 cell.fill = header_fill
                 cell.alignment = header_alignment
 
-            # 소계 행에 볼드체 적용
-            if is_subtotal_col is not None:
-                bold_font = Font(bold=True)
-                for row_idx, is_sub in enumerate(is_subtotal_col):
-                    if is_sub:
-                        # openpyxl 행은 1-based, 헤더가 있으므로 +2
-                        for cell in ws[row_idx + 2]:
-                            cell.font = bold_font
-
             # 열 너비 및 숫자 서식 적용
-            for i, column_name in enumerate(df_to_write.columns, 1): # openpyxl은 1-based index
+            for i, column_name in enumerate(df.columns, 1): # openpyxl은 1-based index
                 column_letter = get_column_letter(i)
                 ws.column_dimensions[column_letter].width = 17
                 
-                if pd.api.types.is_numeric_dtype(df_to_write[df_to_write.columns[i-1]]):
+                if pd.api.types.is_numeric_dtype(df[df.columns[i-1]]):
                     for cell in ws[column_letter][1:]:
                         if isinstance(cell.value, (int, float)):
                             cell.number_format = '#,##0'
@@ -110,6 +98,7 @@ def log_validation(message):
 AMOUNT_COL_CANDIDATES = ("외화금액", "FC_Amount", "Amount")
 EQUITY_CARRY_COL = "이월금액"
 NAME_COL_CANDIDATES = ("계정명", "Account", "Name")
+RE_NEW_NAME = "이월이익잉여금(환산)"
 EPS_BS = 1e-6
 
 def _first_numeric_in_row(row):
@@ -188,6 +177,8 @@ def translate_fcfs(df, closing_rate, average_rate, eps=EPS_BS):
         new_row[amount_col] = 0.0
         if EQUITY_CARRY_COL in df.columns:
             new_row[EQUITY_CARRY_COL] = 0.0
+        if name_col is not None:
+            new_row[name_col] = RE_NEW_NAME
         df = pd.concat([df, pd.DataFrame([new_row])], ignore_index=True)
         is_RE = df["FS_Element"].eq("RE")
     assets_sum = df.loc[df["FS_Element"].eq("A"), out_col].sum()
@@ -228,7 +219,7 @@ with st.sidebar:
     st.session_state.files["coa"] = st.file_uploader("1. CoA (계정 체계)", type="xlsx", key="coa_uploader")
     st.session_state.files["parent"] = st.file_uploader("2. 모회사 재무제표 (BSPL, CF 시트 포함)", type="xlsx", key="parent_uploader")
     st.session_state.files["subsidiaries"] = st.file_uploader("3. 자회사 재무제표 (다중 선택 가능)", type="xlsx", accept_multiple_files=True, key="subs_uploader")
-    st.session_state.files["adjustment"] = st.file_uploader("4. 연결 조정 분개 (CAJE 업로드)", type="xlsx", key="adj_uploader")
+    st.session_state.files["adjustment"] = st.file_uploader("4. 연결 조정 분개 (BS/PL CAJE 수동 업로드용)", type="xlsx", key="adj_uploader")
 
 # --- 탭 구성 ---
 tab1, tab2, tab3, tab4 = st.tabs(["📈 연결 재무제표", "📝 주석 대사", "🔁 연결조정", "🌍 외화FS환산"])
@@ -240,371 +231,141 @@ with tab1:
     st.header("1. 연결 재무제표 생성")
     st.write("CoA, 모회사, 자회사 재무제표와 연결 조정 데이터를 통합하여 연결 재무상태표, 손익계산서, 현금흐름표를 생성합니다.")
 
-    if st.button("🚀 연결 재무제표 생성 실행", key="run_consolidation", disabled=not (st.session_state.files["coa"] and st.session_state.files["parent"])):
+    if st.button("🚀 연결 재무제표 생성 실행", disabled=not (st.session_state.files["coa"] and st.session_state.files["parent"])):
         with st.spinner("데이터를 처리하고 있습니다... 잠시만 기다려주세요."):
-            # Reset previous results
             st.session_state.results["validation_log"] = []
-            st.session_state.results['consolidation_wp_bs'] = None
-            st.session_state.results['consolidation_wp_pl'] = None
-            st.session_state.results['consolidation_wp_cf'] = None
 
             try:
-                # ----------------------------------------------------------------
-                # 1. 데이터 준비 (파일 읽기 및 전처리)
-                # ----------------------------------------------------------------
-                @st.cache_data
-                def load_and_clean_data(coa_file, parent_file, subs_files, adj_file):
-                    def clean_df(df, key_col='계정코드'):
-                        if key_col in df.columns:
-                            df[key_col] = df[key_col].astype(str).str.strip().str.split('.').str[0]
-                            df = df.dropna(subset=[key_col])
-                        return df
+                def clean_df(df):
+                    if "계정코드" in df.columns:
+                        df = df.dropna(subset=["계정코드"])
+                        df["계정코드"] = df["계정코드"].astype(str).str.strip().str.split('.').str[0]
+                    return df
 
-                    def read_fs_sheets(file, file_name=""):
-                        try:
-                            xls = pd.ExcelFile(file)
-                            bspl_df = pd.read_excel(xls, sheet_name='BSPL', dtype={'계정코드': str}) if 'BSPL' in xls.sheet_names else pd.DataFrame()
-                            cf_df = pd.read_excel(xls, sheet_name='CF', dtype={'계정코드': str, 'CF_code': str}) if 'CF' in xls.sheet_names else pd.DataFrame()
-                            
-                            bspl_df = clean_df(bspl_df, '계정코드')
-                            if 'CF_code' in cf_df.columns:
-                                cf_df = clean_df(cf_df, 'CF_code')
-                            elif '계정코드' in cf_df.columns:
-                                cf_df = clean_df(cf_df, '계정코드').rename(columns={'계정코드': 'CF_code'})
+                def read_fs_sheets(file):
+                    xls = pd.ExcelFile(file)
+                    bspl_df = pd.read_excel(xls, sheet_name='BSPL', dtype={"계정코드": str}) if 'BSPL' in xls.sheet_names else pd.DataFrame()
+                    cf_df = pd.read_excel(xls, sheet_name='CF', dtype={"계정코드": str}) if 'CF' in xls.sheet_names else pd.DataFrame()
+                    return clean_df(bspl_df), clean_df(cf_df)
 
-                            # 금액 컬럼 통일 및 숫자형 변환
-                            for df in [bspl_df, cf_df]:
-                                if '금액' in df.columns:
-                                    df['금액'] = pd.to_numeric(df['금액'], errors='coerce').fillna(0)
-                            
-                            return bspl_df, cf_df
-                        except Exception as e:
-                            st.error(f"'{file_name}' 파일 처리 중 오류: {e}")
-                            return pd.DataFrame(), pd.DataFrame()
+                coa_df = clean_df(pd.read_excel(st.session_state.files["coa"], sheet_name="CoA", dtype=str))
+                parent_bspl_df, parent_cf_df = read_fs_sheets(st.session_state.files["parent"])
+                
+                subs_bspl_dfs, subs_cf_dfs = [], []
+                for i, f in enumerate(st.session_state.files["subsidiaries"]):
+                    bspl, cf = read_fs_sheets(f)
+                    subs_bspl_dfs.append(bspl.rename(columns={'금액': f'자회사{i+1}'}))
+                    subs_cf_dfs.append(cf.rename(columns={'금액': f'자회사{i+1}'}))
 
-                    # CoA 데이터 로드
-                    coa_df = clean_df(pd.read_excel(coa_file, sheet_name="CoA", dtype=str), '계정코드')
-                    xls_coa = pd.ExcelFile(coa_file)
-                    cf_coa_df = pd.DataFrame()
-                    if 'CF' in xls_coa.sheet_names:
-                        cf_coa_df = pd.read_excel(xls_coa, sheet_name="CF", dtype=str)
-                        if 'CF_code' in cf_coa_df.columns:
-                            cf_coa_df = clean_df(cf_coa_df, 'CF_code')
+                caje_bspl_df = st.session_state.results.get('caje_bspl_df')
+                if caje_bspl_df is None or caje_bspl_df.empty:
+                    if st.session_state.files["adjustment"]:
+                        caje_bspl_df = clean_df(pd.read_excel(st.session_state.files["adjustment"], dtype={"계정코드": str}))
                     else:
-                        log_validation("경고: CoA 파일에 'CF' 시트가 없습니다. 현금흐름표 집계가 제한될 수 있습니다.")
-
-                    # 모회사 데이터 로드
-                    parent_bspl_df, parent_cf_df = read_fs_sheets(parent_file, "모회사")
-                    parent_bspl_df = parent_bspl_df.rename(columns={'금액': '모회사'})
-                    parent_cf_df = parent_cf_df.rename(columns={'금액': '모회사'})
-
-                    # 자회사 데이터 로드
-                    subs_bspl_dfs, subs_cf_dfs = [], []
-                    for i, f in enumerate(subs_files):
-                        bspl, cf = read_fs_sheets(f, f"자회사{i+1}")
-                        subs_bspl_dfs.append(bspl.rename(columns={'금액': f'자회사{i+1}'}))
-                        subs_cf_dfs.append(cf.rename(columns={'금액': f'자회사{i+1}'}))
-
-                    # 조정분개 데이터 로드
-                    caje_bspl_df = pd.DataFrame()
-                    caje_cf_df = pd.DataFrame()
-                    if adj_file:
-                        try:
-                            xls_adj = pd.ExcelFile(adj_file)
-                            if 'CAJE_BSPL' in xls_adj.sheet_names:
-                                caje_bspl_df = pd.read_excel(xls_adj, sheet_name='CAJE_BSPL', dtype={"계정코드": str})
-                                caje_bspl_df = clean_df(caje_bspl_df, '계정코드')
-                                if '금액' in caje_bspl_df.columns:
-                                    caje_bspl_df['금액'] = pd.to_numeric(caje_bspl_df['금액'], errors='coerce').fillna(0)
-                                else:
-                                    log_validation("경고: 조정분개 파일의 'CAJE_BSPL' 시트에 '금액' 컬럼이 없습니다.")
-                            
-                            if 'CAJE_CF' in xls_adj.sheet_names:
-                                caje_cf_df = pd.read_excel(xls_adj, sheet_name='CAJE_CF', dtype={"계정코드": str})
-                                caje_cf_df = clean_df(caje_cf_df, '계정코드')
-                                if '조정금액' in caje_cf_df.columns:
-                                    caje_cf_df['조정금액'] = pd.to_numeric(caje_cf_df['조정금액'], errors='coerce').fillna(0)
-                                else:
-                                    log_validation("경고: 조정분개 파일의 'CAJE_CF' 시트에 '조정금액' 컬럼이 없습니다.")
-                        except Exception as e:
-                            log_validation(f"🚨 오류: 조정분개 파일({adj_file.name}) 처리 중 오류 발생: {e}")
-                    
-                    
-
-                    return coa_df, cf_coa_df, parent_bspl_df, parent_cf_df, subs_bspl_dfs, subs_cf_dfs, caje_bspl_df, caje_cf_df
+                        caje_bspl_df = pd.DataFrame(columns=['계정코드', '금액'])
                 
-                coa_df, cf_coa_df, parent_bspl_df, parent_cf_df, subs_bspl_dfs, subs_cf_dfs, caje_bspl_df, caje_cf_df_from_file = load_and_clean_data(st.session_state.files["coa"], st.session_state.files["parent"], st.session_state.files["subsidiaries"], st.session_state.files["adjustment"])
-
-                # ----------------------------------------------------------------
-                # 2. 데이터 검증
-                # ----------------------------------------------------------------
-                def check_duplicates(df, name):
-                    if '계정코드' in df.columns:
-                        dups = df['계정코드'].value_counts().loc[lambda x: x > 1]
-                        if not dups.empty:
-                            log_validation(f"⚠️ **[{name}]** 중복 계정코드 발견: {', '.join(dups.index)}")
-
-                def check_missing_in_coa(df, coa_codes, name):
-                    if '계정코드' in df.columns:
-                        missing = set(df['계정코드']) - coa_codes
-                        if missing:
-                            log_validation(f"🚨 **[{name}]** CoA에 없는 계정코드 발견: {', '.join(sorted(list(missing)))}")
-                
-                def check_balance_sheet_equation(df, coa_df, column_name):
-                    """재무상태표 차대 검증 (자산 = 부채 + 자본)"""
-                    if '계정코드' in df.columns and column_name in df.columns:
-                        if 'FS_Element' in df.columns:
-                            merged = df
-                        elif 'FS_Element' in coa_df.columns:
-                            merged = df.merge(coa_df[['계정코드', 'FS_Element']], on='계정코드', how='left')
-                        else:
-                            return # Cannot perform check
-
-                        total_assets = pd.to_numeric(merged[merged['FS_Element'] == 'A'][column_name], errors='coerce').sum()
-                        total_liabilities = pd.to_numeric(merged[merged['FS_Element'] == 'L'][column_name], errors='coerce').sum()
-                        total_equity = pd.to_numeric(merged[merged['FS_Element'] == 'E'][column_name], errors='coerce').sum()
-                        difference = total_assets - (total_liabilities + total_equity)
-                        
-                        if abs(difference) > 1: # 사소한 반올림 오류는 무시
-                            log_validation(f"❌ **[{column_name}]** 재무상태표 차대 불일치: {difference:,.0f}")
-                        else:
-                            log_validation(f"✅ **[{column_name}]** 재무상태표 차대 일치")
-
-                check_duplicates(parent_bspl_df, "모회사")
-                for i, df in enumerate(subs_bspl_dfs):
-                    check_duplicates(df, f"자회사{i+1}")
-
-                coa_codes = set(coa_df['계정코드'])
-                check_missing_in_coa(parent_bspl_df, coa_codes, "모회사")
-                for i, df in enumerate(subs_bspl_dfs):
-                    check_missing_in_coa(df, coa_codes, f"자회사{i+1}")
-
-                # ----------------------------------------------------------------
-                # 2. BS/PL 데이터 통합 및 계산
-                # ----------------------------------------------------------------
-                # BS/PL 데이터 병합 (sort=False를 추가하여 CoA 순서 유지)
-                merged_bspl_df = coa_df.merge(parent_bspl_df[['계정코드', '모회사']], on='계정코드', how='left', sort=False)
-                for i, df in enumerate(subs_bspl_dfs):
-                    merged_bspl_df = merged_bspl_df.merge(df[['계정코드', f'자회사{i+1}']], on='계정코드', how='left', sort=False)
-
-                # 숫자 컬럼 정의 및 NaN 값 처리
-                bspl_val_cols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_bspl_dfs))]
-                merged_bspl_df[bspl_val_cols] = merged_bspl_df[bspl_val_cols].fillna(0)
-
-                # 단순합계 계산
-                merged_bspl_df['단순합계'] = merged_bspl_df[bspl_val_cols].sum(axis=1)
-
-                # --- 추가된 차대 검증 실행 ---
-                check_balance_sheet_equation(merged_bspl_df, coa_df, '모회사')
-                for i, df in enumerate(subs_bspl_dfs):
-                    check_balance_sheet_equation(merged_bspl_df, coa_df, f'자회사{i+1}')
-                check_balance_sheet_equation(merged_bspl_df, coa_df, '단순합계')
-                # ------------------------------
-
-                # 조정분개 병합 (sort=False를 추가하여 CoA 순서 유지)
-                if not caje_bspl_df.empty and '계정코드' in caje_bspl_df.columns:
-                    adj_bspl_grouped = caje_bspl_df.groupby('계정코드')['금액'].sum().reset_index()
-                    merged_bspl_df = merged_bspl_df.merge(adj_bspl_grouped.rename(columns={'금액': '연결조정'}), on='계정코드', how='left', sort=False)
-                    merged_bspl_df['연결조정'] = merged_bspl_df['연결조정'].fillna(0)
-                else:
-                    merged_bspl_df['연결조정'] = 0
-
-                # 연결금액 계산
-                merged_bspl_df['연결금액'] = merged_bspl_df['단순합계'] + merged_bspl_df['연결조정']
-
-                # ----------------------------------------------------------------
-                # 3. CF 데이터 통합 및 계산
-                # ----------------------------------------------------------------
-                CF_KEY = 'CF_code'
-                merged_cf_df = pd.DataFrame()
-                if not cf_coa_df.empty and CF_KEY in cf_coa_df.columns:
-                    # sort=False를 추가하여 CoA 순서 유지
-                    merged_cf_df = cf_coa_df.merge(parent_cf_df[[CF_KEY, '모회사']], on=CF_KEY, how='left', sort=False)
-                    for i, df in enumerate(subs_cf_dfs):
-                        if CF_KEY in df.columns:
-                            merged_cf_df = merged_cf_df.merge(df[[CF_KEY, f'자회사{i+1}']], on=CF_KEY, how='left', sort=False)
-
-                    cf_val_cols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_cf_dfs))]
-                    merged_cf_df[cf_val_cols] = merged_cf_df[cf_val_cols].fillna(0)
-                    merged_cf_df['단순합계'] = merged_cf_df[cf_val_cols].sum(axis=1)
-                    
-                    # CF 조정분개 처리 (업로드된 파일만 사용)
-                    caje_cf_df = caje_cf_df_from_file
-
-                    # 사용자의 요청에 따라, '계정코드'를 기준으로 조정분개를 병합
-                    if not caje_cf_df.empty and '계정코드' in caje_cf_df.columns and '조정금액' in caje_cf_df.columns:
-                        adj_cf_grouped = caje_cf_df.groupby('계정코드')['조정금액'].sum().reset_index()
-                        
-                        merged_cf_df = merged_cf_df.merge(
-                            adj_cf_grouped.rename(columns={'조정금액': '연결조정'}),
-                            on='계정코드',
-                            how='left'
-                        )
-                    else:
-                        merged_cf_df['연결조정'] = 0
-                    
-                    merged_cf_df['연결조정'] = merged_cf_df['연결조정'].fillna(0)
-                    merged_cf_df['연결금액'] = merged_cf_df['단순합계'] + merged_cf_df['연결조정']
-                
-                # ----------------------------------------------------------------
-                # 4. 소계 및 최종 FS 생성
-                # ----------------------------------------------------------------
-                def generate_fs_with_subtotals(df, name_cols, amount_cols, name_code_map, desc_col='계정명', code_col='계정코드'):
-                    df = df.copy()
-                    
-                    # Sign 로직 적용
-                    apply_sign_logic = 'sign' in df.columns
-                    if apply_sign_logic:
-                        df['sign'] = pd.to_numeric(df['sign'], errors='coerce').fillna(1)
-                        for col in amount_cols:
-                            if col in df.columns:
-                                df[col] = df[col] * df["sign"]
-                    
-                    # 소계 계산을 위한 재귀 함수
-                    def recursive_subtotal(data, current_name_cols, level=0):
-                        if not current_name_cols or data.empty:
-                            return data
-                        
-                        current_col, remaining_cols = current_name_cols[0], current_name_cols[1:]
-                        all_sub_dfs = []
-                        
-                        # 레벨 정보가 있는 그룹 먼저 처리
-                        for key, group in data.dropna(subset=[current_col]).groupby(current_col, sort=False):
-                            sub_df = recursive_subtotal(group, remaining_cols, level + 1)
-                            
-                            # 합계 행 생성
-                            sum_data = {col: '' for col in data.columns}
-                            sum_data.update(group[amount_cols].sum())
-                            sum_data[desc_col] = f"{'' * level}{key}" # 들여쓰기
-                            sum_data[code_col] = name_code_map.get(key, '')
-                            
-                            # FS_Element, sign 등 메타데이터 복사
-                            if not group.empty:
-                                for col in ['FS_Element', 'sign']:
-                                    if col in group.columns:
-                                        sum_data[col] = group.iloc[0][col]
-                            
-                            sum_row = pd.DataFrame([sum_data])
-                            all_sub_dfs.append(pd.concat([sub_df, sum_row], ignore_index=True))
-
-                        # 레벨 정보가 없는(NaN) 그룹을 나중에 처리하여 아래로 보냄
-                        nan_group = data[data[current_col].isna()]
-                        if not nan_group.empty:
-                            all_sub_dfs.append(recursive_subtotal(nan_group, remaining_cols, level + 1))
-                            
-                        # all_sub_dfs가 비어있는 경우 에러 방지
-                        if not all_sub_dfs:
-                            return pd.DataFrame(columns=data.columns)
-
-                        return pd.concat(all_sub_dfs, ignore_index=True)
-
-                    final_df = recursive_subtotal(df, name_cols)
-                    
-                    # Sign 원복
-                    if apply_sign_logic and not final_df.empty:
-                        final_df['sign'] = pd.to_numeric(final_df['sign'], errors='coerce').fillna(1).replace(0, 1)
-                        final_df[amount_cols] = final_df[amount_cols].divide(final_df['sign'], axis=0)
-                    
-                    return final_df
-
-                # BS, PL, CF 데이터 분리 및 소계 생성
-                df_bs = merged_bspl_df[merged_bspl_df["FS_Element"].isin(["A", "L", "E"])].copy()
-                df_pl = merged_bspl_df[merged_bspl_df["FS_Element"].isin(["R", "X"])].copy()
-                df_pl["sign"] = df_pl["FS_Element"].map({"R": 1, "X": -1}).fillna(1)
-                
-                df_cf = merged_cf_df.copy()
-                if 'FS_Element' in df_cf.columns: # CF의 FS_Element는 부호로 사용
-                    df_cf['sign'] = pd.to_numeric(df_cf['FS_Element'], errors='coerce').fillna(1)
-                
-                
-
-                # 소계 생성을 위한 설정
-                con_amtcols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_bspl_dfs))] + ['단순합계', '연결조정', '연결금액']
-                bspl_name_cols = [c for c in coa_df.columns if c.startswith('L') and not c.endswith('code')]
-                cf_name_cols = [c for c in cf_coa_df.columns if c.startswith('L') and not c.endswith('code')]
-                
-                # 이름-코드 매핑 생성
-                bspl_name_code_map = {row[name]: row[code] for code, name in zip([c for c in coa_df.columns if c.startswith('L') and c.endswith('code')], bspl_name_cols) for _, row in coa_df.iterrows() if pd.notna(row.get(name))}
-                cf_name_code_map = {row[name]: row[code] for code, name in zip([c for c in cf_coa_df.columns if c.startswith('L') and c.endswith('code')], cf_name_cols) for _, row in cf_coa_df.iterrows() if pd.notna(row.get(name))}
-
-                # 최종 FS 생성
-                bs_final = generate_fs_with_subtotals(df_bs, bspl_name_cols, con_amtcols, bspl_name_code_map)
-                pl_final = generate_fs_with_subtotals(df_pl, bspl_name_cols, con_amtcols, bspl_name_code_map)
-                cf_final = generate_fs_with_subtotals(df_cf, cf_name_cols, con_amtcols, cf_name_code_map, desc_col='현금흐름표', code_col='CF_code')
-
-                # 불필요한 레벨 컬럼 제거 및 최종 정리
-                level_cols = [c for c in coa_df.columns if c.startswith('L')] + [c for c in cf_coa_df.columns if c.startswith('L')]
-                l_cols_to_drop = list(set(level_cols + ['sign']))
-                bs_final.drop(columns=[c for c in l_cols_to_drop if c in bs_final.columns], inplace=True)
-                pl_final.drop(columns=[c for c in l_cols_to_drop if c in pl_final.columns], inplace=True)
-                cf_final.drop(columns=[c for c in l_cols_to_drop if c in cf_final.columns], inplace=True)
-
-                # 소계 행 식별 및 'is_subtotal' 컬럼 추가
-                bspl_name_cols = [c for c in coa_df.columns if c.startswith('L') and not c.endswith('code')]
-                if bspl_name_cols:
-                    bspl_subtotal_names = set(coa_df[bspl_name_cols].stack().unique())
-                    if not bs_final.empty:
-                        bs_final['is_subtotal'] = bs_final['계정명'].isin(bspl_subtotal_names)
-                    if not pl_final.empty:
-                        pl_final['is_subtotal'] = pl_final['계정명'].isin(bspl_subtotal_names)
-
-                cf_name_cols = [c for c in cf_coa_df.columns if c.startswith('L') and not c.endswith('code')]
-                if not cf_coa_df.empty and cf_name_cols:
-                        cf_subtotal_names = set(cf_coa_df[cf_name_cols].stack().unique())
-                        if not cf_final.empty:
-                            cf_final['is_subtotal'] = cf_final['현금흐름표'].isin(cf_subtotal_names)
-
-                # 0에 가까운 값 정리 및 정수 변환
-                processed_dfs = []
-                for df in [bs_final, pl_final, cf_final]:
-                    if not df.empty:
-                        df = df.copy()
-                        amt_cols_in_df = [c for c in con_amtcols if c in df.columns]
-
-                        if amt_cols_in_df:
-                            df.loc[(df[amt_cols_in_df].abs().sum(axis=1)) < 0.01, amt_cols_in_df] = 0
-                            df[amt_cols_in_df] = df[amt_cols_in_df].fillna(0).round().astype('int64')
-
-                            # 금액이 모두 0이면서 소계가 아닌 행을 제거
-                            if 'is_subtotal' in df.columns:
-                                all_zeros = (df[amt_cols_in_df] == 0).all(axis=1)
-                                is_not_subtotal = df['is_subtotal'] == False
-                                rows_to_remove = all_zeros & is_not_subtotal
-                                df = df[~rows_to_remove]
-                            else:
-                                log_validation("⚠️ 경고: 'is_subtotal' 컬럼이 없어 일부 0원 행이 제거되지 않을 수 있습니다.")
-                    processed_dfs.append(df)
-                bs_final, pl_final, cf_final = processed_dfs
-
-
-                # 세션 상태에 결과 저장
-                st.session_state.results['consolidation_wp_bs'] = bs_final
-                st.session_state.results['consolidation_wp_pl'] = pl_final
-                st.session_state.results['consolidation_wp_cf'] = cf_final
-                
-                st.success("🎉 연결 재무제표 생성이 완료되었습니다!")
-
             except Exception as e:
-                st.error(f"연결 재무제표 생성 중 오류가 발생했습니다: {e}")
-                st.exception(e) # 개발/디버깅 시 traceback을 보기 위해 추가
+                st.error(f"파일을 읽는 중 오류가 발생했습니다: {e}")
+                st.stop()
+
+            # --- BS/PL 데이터 처리 ---
+            merged_bspl_df = coa_df.merge(parent_bspl_df.rename(columns={'금액': '모회사'})[['계정코드', '모회사']], on='계정코드', how='left')
+            for df in subs_bspl_dfs:
+                merged_bspl_df = merged_bspl_df.merge(df[['계정코드', df.columns[-1]]], on='계정코드', how='left')
+            
+            bspl_val_cols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_bspl_dfs))]
+            merged_bspl_df[bspl_val_cols] = merged_bspl_df[bspl_val_cols].fillna(0)
+            merged_bspl_df['단순합계'] = merged_bspl_df[bspl_val_cols].sum(axis=1)
+
+            adj_bspl_grouped = caje_bspl_df.groupby('계정코드', as_index=False)['금액'].sum()
+            merged_bspl_df = merged_bspl_df.merge(adj_bspl_grouped.rename(columns={'금액': '연결조정'}), on='계정코드', how='left')
+            merged_bspl_df['연결조정'] = merged_bspl_df['연결조정'].fillna(0)
+            merged_bspl_df['연결금액'] = merged_bspl_df['단순합계'] + merged_bspl_df['연결조정']
+
+            # --- CF 데이터 처리 ---
+            cf_coa_df = coa_df[coa_df['FS_Element'] == 'CF'].copy()
+            merged_cf_df = cf_coa_df.merge(parent_cf_df.rename(columns={'금액': '모회사'})[['계정코드', '모회사']], on='계정코드', how='left')
+            for df in subs_cf_dfs:
+                merged_cf_df = merged_cf_df.merge(df[['계정코드', df.columns[-1]]], on='계정코드', how='left')
+
+            cf_val_cols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_cf_dfs))]
+            merged_cf_df[cf_val_cols] = merged_cf_df[cf_val_cols].fillna(0)
+            merged_cf_df['단순합계'] = merged_cf_df[cf_val_cols].sum(axis=1)
+
+            caje_cf_df = st.session_state.results.get('caje_cf_df', pd.DataFrame())
+            if not caje_cf_df.empty and 'CF_Map_Code' in coa_df.columns:
+                caje_cf_with_map = caje_cf_df.merge(coa_df[['계정코드', 'CF_Map_Code']].dropna(), on='계정코드', how='left')
+                adj_cf_grouped = caje_cf_with_map.groupby('CF_Map_Code', as_index=False)['조정금액'].sum()
+                merged_cf_df = merged_cf_df.merge(adj_cf_grouped.rename(columns={'조정금액': '연결조정', 'CF_Map_Code': '계정코드'}), on='계정코드', how='left')
+            else:
+                merged_cf_df['연결조정'] = 0
+            
+            merged_cf_df['연결조정'] = merged_cf_df['연결조정'].fillna(0)
+            merged_cf_df['연결금액'] = merged_cf_df['단순합계'] + merged_cf_df['연결조정']
+
+            # --- 최종 FS 생성 ---
+            df_bs = merged_bspl_df[merged_bspl_df["FS_Element"].isin(["A", "L", "E"])].copy()
+            df_pl = merged_bspl_df[merged_bspl_df["FS_Element"].isin(["R", "X"])].copy()
+            df_cf = merged_cf_df.copy()
+
+            con_amtcols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_bspl_dfs))] + ['단순합계', '연결조정', '연결금액']
+            code_cols = [c for c in coa_df.columns if c.startswith('L') and c.endswith('code')]
+            name_cols = [c for c in coa_df.columns if c.startswith('L') and not c.endswith('code')]
+            name_code_map = {row[name]: row[code] for code, name in zip(code_cols, name_cols) for _, row in coa_df.iterrows() if pd.notna(row[code]) and pd.notna(row[name])}
+
+            def generate_fs_with_subtotals(df, name_cols, amount_cols, is_pl=False):
+                df = df.copy()
+                if is_pl:
+                    df["sign"] = df["FS_Element"].map({"R": 1, "X": -1}).fillna(1)
+                    for col in amount_cols:
+                        df[col] = df[col] * df["sign"]
+                def recursive_subtotal(data, current_name_cols):
+                    if not current_name_cols or data.empty: return data
+                    current_col, remaining_cols = current_name_cols[0], current_name_cols[1:]
+                    all_sub_dfs = []
+                    for key, group in data.groupby(current_col, sort=False, dropna=False):
+                        if pd.isna(key) or key == '':
+                            all_sub_dfs.append(group)
+                            continue
+                        sub_df = recursive_subtotal(group, remaining_cols)
+                        sum_row = group.iloc[0:1].copy()
+                        sum_row.loc[sum_row.index[0], amount_cols] = group[amount_cols].sum().values
+                        sum_row.loc[sum_row.index[0], '계정명'] = key
+                        sum_row.loc[sum_row.index[0], '계정코드'] = name_code_map.get(key, '')
+                        for col in remaining_cols:
+                            if col in sum_row.columns: sum_row.loc[sum_row.index[0], col] = ''
+                        all_sub_dfs.append(pd.concat([sub_df, sum_row], ignore_index=True))
+                    return pd.concat(all_sub_dfs, ignore_index=True)
+                final_df = recursive_subtotal(df, name_cols)
+                if is_pl and not final_df.empty:
+                    final_df[amount_cols] = final_df[amount_cols].divide(final_df['sign'], axis=0)
+                    final_df = final_df.drop(columns=['sign'])
+                return final_df
+
+            bs_final = generate_fs_with_subtotals(df_bs, name_cols, con_amtcols, is_pl=False)
+            pl_final = generate_fs_with_subtotals(df_pl, name_cols, con_amtcols, is_pl=True)
+            cf_final = generate_fs_with_subtotals(df_cf, name_cols, con_amtcols, is_pl=False)
+            
+            bs_final = bs_final.loc[(bs_final[con_amtcols].abs().sum(axis=1)) > 1e-6]
+            pl_final = pl_final.loc[(pl_final[con_amtcols].abs().sum(axis=1)) > 1e-6]
+            cf_final = cf_final.loc[(cf_final[con_amtcols].abs().sum(axis=1)) > 1e-6]
+
+            st.session_state.results['consolidation_wp_bs'] = bs_final
+            st.session_state.results['consolidation_wp_pl'] = pl_final
+            st.session_state.results['consolidation_wp_cf'] = cf_final
+            st.session_state.results['con_amtcols'] = con_amtcols
+
+            st.success("🎉 연결 재무제표 생성이 완료되었습니다!")
 
     # --- 결과 표시 ---
-    if st.session_state.results["validation_log"]:
-        with st.expander("🔍 데이터 검증 로그 보기", expanded=True):
-            for log in st.session_state.results["validation_log"]:
-                st.markdown(log, unsafe_allow_html=True)
-
-    if st.session_state.results.get("consolidation_wp_bs") is not None and not st.session_state.results["consolidation_wp_bs"].empty:
+    if st.session_state.results.get("consolidation_wp_bs") is not None:
         st.subheader("📄 연결 재무상태표")
-        st.dataframe(st.session_state.results['consolidation_wp_bs'].style.format(precision=0, thousands=","))
-        
+        st.dataframe(st.session_state.results['consolidation_wp_bs'])
         st.subheader("📄 연결 손익계산서")
-        st.dataframe(st.session_state.results['consolidation_wp_pl'].style.format(precision=0, thousands=","))
-        
+        st.dataframe(st.session_state.results['consolidation_wp_pl'])
         st.subheader("📄 연결 현금흐름표")
-        st.dataframe(st.session_state.results['consolidation_wp_cf'].style.format(precision=0, thousands=","))
+        st.dataframe(st.session_state.results['consolidation_wp_cf'])
 
-        # --- 다운로드 버튼 ---
         excel_data = to_excel({
             "Consol_BS": st.session_state.results['consolidation_wp_bs'],
             "Consol_PL": st.session_state.results['consolidation_wp_pl'],
@@ -619,6 +380,9 @@ with tab1:
     elif not (st.session_state.files["coa"] and st.session_state.files["parent"]):
         st.info("사이드바에서 CoA와 모회사 파일을 업로드한 후 '생성 실행' 버튼을 눌러주세요.")
 
+# =================================================================================================
+# --- 주석 대사 탭 ---
+# =================================================================================================
 with tab2:
     st.header("2. 주석 대사 (Reconciliation)")
     st.write("모회사 주석을 기준으로 자회사 주석들의 숫자 데이터를 위치 기반으로 합산하고, 연결정산표와 대사합니다.")
@@ -698,6 +462,9 @@ with tab2:
         footnote_excel_data = to_excel(st.session_state.results['combined_footnotes'])
         st.download_button(label="📥 취합된 주석 다운로드 (Excel)", data=footnote_excel_data, file_name="combined_footnotes.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
+# =================================================================================================
+# --- 연결조정 탭 ---
+# =================================================================================================
 with tab3:
     st.header("3. 연결 조정 분개 생성")
     st.write("조정분개 입력 템플릿을 다운로드하여 작성한 후, 업로드하여 BS/IS 및 현금흐름표(CF) 목적의 연결 조정 분개(CAJE)를 생성합니다.")
@@ -948,6 +715,9 @@ with tab3:
         st.download_button(label="📥 생성된 조정 분개(CAJE) 다운로드 (.xlsx)", data=caje_excel_data, file_name="CAJE_generated.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
         st.info("생성된 BS/PL CAJE 데이터는 '연결 재무제표' 탭의 '연결 조정' 데이터로 사용할 수 있습니다.")
 
+# =================================================================================================
+# --- 외화FS환산 탭 ---
+# =================================================================================================
 with tab4:
     st.header("4. 외화 재무제표 환산")
     st.write("외화로 작성된 재무제표(FS) 파일을 업로드하면, 지정된 환율에 따라 원화로 환산하고 결과를 표시합니다.")
@@ -987,4 +757,3 @@ with tab4:
         st.dataframe(st.session_state.fcfs_results["summary_df"])
         excel_data = to_excel({"translated": st.session_state.fcfs_results["translated_df"], "summary": st.session_state.fcfs_results["summary_df"]})
         st.download_button(label="📥 환산 결과 다운로드 (Excel)", data=excel_data, file_name="FCFS_translated.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
