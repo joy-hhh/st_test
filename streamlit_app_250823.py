@@ -248,16 +248,12 @@ with tab1:
             st.session_state.results['consolidation_wp_pl'] = None
             st.session_state.results['consolidation_wp_cf'] = None
 
-            # 파일명에서 회사 이름 추출
-            parent_name = st.session_state.files["parent"].name.split('_')[0]
-            subs_names = [f.name.split('_')[0] for f in st.session_state.files["subsidiaries"]]
-
             try:
                 # ----------------------------------------------------------------
                 # 1. 데이터 준비 (파일 읽기 및 전처리)
                 # ----------------------------------------------------------------
                 @st.cache_data
-                def load_and_clean_data(coa_file, parent_file, parent_name, subs_files, subs_names, adj_file):
+                def load_and_clean_data(coa_file, parent_file, subs_files, adj_file):
                     def clean_df(df, key_col='계정코드'):
                         if key_col in df.columns:
                             df[key_col] = df[key_col].astype(str).str.strip().str.split('.').str[0]
@@ -298,16 +294,16 @@ with tab1:
                         log_validation("경고: CoA 파일에 'CF' 시트가 없습니다. 현금흐름표 집계가 제한될 수 있습니다.")
 
                     # 모회사 데이터 로드
-                    parent_bspl_df, parent_cf_df = read_fs_sheets(parent_file, parent_name)
-                    parent_bspl_df = parent_bspl_df.rename(columns={'금액': parent_name})
-                    parent_cf_df = parent_cf_df.rename(columns={'금액': parent_name})
+                    parent_bspl_df, parent_cf_df = read_fs_sheets(parent_file, "모회사")
+                    parent_bspl_df = parent_bspl_df.rename(columns={'금액': '모회사'})
+                    parent_cf_df = parent_cf_df.rename(columns={'금액': '모회사'})
 
                     # 자회사 데이터 로드
                     subs_bspl_dfs, subs_cf_dfs = [], []
-                    for f, sub_name in zip(subs_files, subs_names):
-                        bspl, cf = read_fs_sheets(f, sub_name)
-                        subs_bspl_dfs.append(bspl.rename(columns={'금액': sub_name}))
-                        subs_cf_dfs.append(cf.rename(columns={'금액': sub_name}))
+                    for i, f in enumerate(subs_files):
+                        bspl, cf = read_fs_sheets(f, f"자회사{i+1}")
+                        subs_bspl_dfs.append(bspl.rename(columns={'금액': f'자회사{i+1}'}))
+                        subs_cf_dfs.append(cf.rename(columns={'금액': f'자회사{i+1}'}))
 
                     # 조정분개 데이터 로드
                     caje_bspl_df = pd.DataFrame()
@@ -333,16 +329,11 @@ with tab1:
                         except Exception as e:
                             log_validation(f"🚨 오류: 조정분개 파일({adj_file.name}) 처리 중 오류 발생: {e}")
                     
+                    
+
                     return coa_df, cf_coa_df, parent_bspl_df, parent_cf_df, subs_bspl_dfs, subs_cf_dfs, caje_bspl_df, caje_cf_df
                 
-                coa_df, cf_coa_df, parent_bspl_df, parent_cf_df, subs_bspl_dfs, subs_cf_dfs, caje_bspl_df, caje_cf_df_from_file = load_and_clean_data(
-                    st.session_state.files["coa"], 
-                    st.session_state.files["parent"], 
-                    parent_name, 
-                    st.session_state.files["subsidiaries"], 
-                    tuple(subs_names),  # 리스트는 해시 불가능하므로 튜플로 변환
-                    st.session_state.files["adjustment"]
-                )
+                coa_df, cf_coa_df, parent_bspl_df, parent_cf_df, subs_bspl_dfs, subs_cf_dfs, caje_bspl_df, caje_cf_df_from_file = load_and_clean_data(st.session_state.files["coa"], st.session_state.files["parent"], st.session_state.files["subsidiaries"], st.session_state.files["adjustment"])
 
                 # ----------------------------------------------------------------
                 # 2. 데이터 검증
@@ -379,34 +370,34 @@ with tab1:
                         else:
                             log_validation(f"✅ **[{column_name}]** 재무상태표 차대 일치")
 
-                check_duplicates(parent_bspl_df, parent_name)
-                for name, df in zip(subs_names, subs_bspl_dfs):
-                    check_duplicates(df, name)
+                check_duplicates(parent_bspl_df, "모회사")
+                for i, df in enumerate(subs_bspl_dfs):
+                    check_duplicates(df, f"자회사{i+1}")
 
                 coa_codes = set(coa_df['계정코드'])
-                check_missing_in_coa(parent_bspl_df, coa_codes, parent_name)
-                for name, df in zip(subs_names, subs_bspl_dfs):
-                    check_missing_in_coa(df, coa_codes, name)
+                check_missing_in_coa(parent_bspl_df, coa_codes, "모회사")
+                for i, df in enumerate(subs_bspl_dfs):
+                    check_missing_in_coa(df, coa_codes, f"자회사{i+1}")
 
                 # ----------------------------------------------------------------
                 # 2. BS/PL 데이터 통합 및 계산
                 # ----------------------------------------------------------------
                 # BS/PL 데이터 병합 (sort=False를 추가하여 CoA 순서 유지)
-                merged_bspl_df = coa_df.merge(parent_bspl_df[['계정코드', parent_name]], on='계정코드', how='left', sort=False)
-                for name, df in zip(subs_names, subs_bspl_dfs):
-                    merged_bspl_df = merged_bspl_df.merge(df[['계정코드', name]], on='계정코드', how='left', sort=False)
+                merged_bspl_df = coa_df.merge(parent_bspl_df[['계정코드', '모회사']], on='계정코드', how='left', sort=False)
+                for i, df in enumerate(subs_bspl_dfs):
+                    merged_bspl_df = merged_bspl_df.merge(df[['계정코드', f'자회사{i+1}']], on='계정코드', how='left', sort=False)
 
                 # 숫자 컬럼 정의 및 NaN 값 처리
-                bspl_val_cols = [parent_name] + subs_names
+                bspl_val_cols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_bspl_dfs))]
                 merged_bspl_df[bspl_val_cols] = merged_bspl_df[bspl_val_cols].fillna(0)
 
                 # 단순합계 계산
                 merged_bspl_df['단순합계'] = merged_bspl_df[bspl_val_cols].sum(axis=1)
 
                 # --- 추가된 차대 검증 실행 ---
-                check_balance_sheet_equation(merged_bspl_df, coa_df, parent_name)
-                for name in subs_names:
-                    check_balance_sheet_equation(merged_bspl_df, coa_df, name)
+                check_balance_sheet_equation(merged_bspl_df, coa_df, '모회사')
+                for i, df in enumerate(subs_bspl_dfs):
+                    check_balance_sheet_equation(merged_bspl_df, coa_df, f'자회사{i+1}')
                 check_balance_sheet_equation(merged_bspl_df, coa_df, '단순합계')
                 # ------------------------------
 
@@ -428,12 +419,12 @@ with tab1:
                 merged_cf_df = pd.DataFrame()
                 if not cf_coa_df.empty and CF_KEY in cf_coa_df.columns:
                     # sort=False를 추가하여 CoA 순서 유지
-                    merged_cf_df = cf_coa_df.merge(parent_cf_df[[CF_KEY, parent_name]], on=CF_KEY, how='left', sort=False)
-                    for name, df in zip(subs_names, subs_cf_dfs):
+                    merged_cf_df = cf_coa_df.merge(parent_cf_df[[CF_KEY, '모회사']], on=CF_KEY, how='left', sort=False)
+                    for i, df in enumerate(subs_cf_dfs):
                         if CF_KEY in df.columns:
-                            merged_cf_df = merged_cf_df.merge(df[[CF_KEY, name]], on=CF_KEY, how='left', sort=False)
+                            merged_cf_df = merged_cf_df.merge(df[[CF_KEY, f'자회사{i+1}']], on=CF_KEY, how='left', sort=False)
 
-                    cf_val_cols = [parent_name] + subs_names
+                    cf_val_cols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_cf_dfs))]
                     merged_cf_df[cf_val_cols] = merged_cf_df[cf_val_cols].fillna(0)
                     merged_cf_df['단순합계'] = merged_cf_df[cf_val_cols].sum(axis=1)
                     
@@ -528,7 +519,7 @@ with tab1:
                 
 
                 # 소계 생성을 위한 설정
-                con_amtcols = [parent_name] + subs_names + ['단순합계', '연결조정', '연결금액']
+                con_amtcols = ['모회사'] + [f'자회사{i+1}' for i in range(len(subs_bspl_dfs))] + ['단순합계', '연결조정', '연결금액']
                 bspl_name_cols = [c for c in coa_df.columns if c.startswith('L') and not c.endswith('code')]
                 cf_name_cols = [c for c in cf_coa_df.columns if c.startswith('L') and not c.endswith('code')]
                 
@@ -859,12 +850,12 @@ with tab3:
                 # Line 1: NI Entry (+)
                 all_cf_entries.append({
                     "조정유형": caje_type, "법인": corp_name, "계정코드": ni_code,
-                    "조정금액": total_pl_impact, "설명": "[비현금손익] 미실현이익(NI)", "CF_FS_Element": 1
+                    "조정금액": total_pl_impact, "설명": "[비현금손익] 미실현이익(NI)", "원계정_FS_Element": "R"
                 })
                 # Line 2: Inventory Entry (-)
                 all_cf_entries.append({
                     "조정유형": caje_type, "법인": corp_name, "계정코드": inventory_acc_code,
-                    "조정금액": -total_pl_impact, "설명": "[비현금손익] 미실현이익(재고)", "CF_FS_Element": 1
+                    "조정금액": -total_pl_impact, "설명": "[비현금손익] 미실현이익(재고)", "원계정_FS_Element": "A"
                 })
             elif caje_type == "CAJE03":
                 if ni_code is None:
@@ -890,43 +881,12 @@ with tab3:
                 # Line 1: NI Entry (+)
                 all_cf_entries.append({
                     "조정유형": caje_type, "법인": corp_name, "계정코드": ni_code,
-                    "조정금액": total_pl_impact, "설명": "[비현금손익] 미실현이익(NI)", "CF_FS_Element": 1
+                    "조정금액": total_pl_impact, "설명": "[비현금손익] 미실현이익(NI)", "원계정_FS_Element": "R"
                 })
-                # Line 2: PL Entry (-)
+                # Line 2: Inventory Entry (-)
                 all_cf_entries.append({
                     "조정유형": caje_type, "법인": corp_name, "계정코드": pl_acc_code,
-                    "조정금액": -total_pl_impact, "설명": "[비현금손익] 미실현이익(손익)", "CF_FS_Element": 1
-                })
-            elif caje_type == "CAJE04":
-                if ni_code is None:
-                    st.warning(f"[{sheet_name}] CF조정 건너뜀: 당기순이익 계정 코드를 CoA에서 찾을 수 없습니다.")
-                    continue
-                df_with_fs = df.merge(coa_df_internal[['계정코드', 'FS_Element']], on='계정코드', how='left')
-                pl_rows = df_with_fs[df_with_fs['FS_Element'].isin(['X', 'R'])].copy()
-                bs_rows = df_with_fs[df_with_fs['FS_Element'].isin(['A', 'L', 'E'])].copy()
-                if pl_rows.empty or bs_rows.empty:
-                    st.warning(f"[{sheet_name}] CF조정 건너뜀: 시트에서 손익(R/X) 또는 재무상태(A/L/E) 계정을 찾을 수 없습니다.")
-                    continue
-
-                pl_pivot = pl_rows.pivot_table(index=['계정코드', 'FS_Element'], columns='당기전기', values='금액', aggfunc='sum').fillna(0)
-                if '당기' not in pl_pivot.columns: pl_pivot['당기'] = 0
-                if '전기' not in pl_pivot.columns: pl_pivot['전기'] = 0
-                pl_pivot['change'] = pl_pivot['당기'] + pl_pivot['전기']
-                pl_pivot['impact'] = pl_pivot.apply(lambda r: r['change'] if r.name[1] == 'X' else -r['change'], axis=1)
-                total_pl_impact = pl_pivot['impact'].sum()
-                
-                pl_acc_code = pl_rows.iloc[0]['계정코드']
-                corp_name = df.iloc[0]['법인']
-
-                # Line 1: NI Entry (+)
-                all_cf_entries.append({
-                    "조정유형": caje_type, "법인": corp_name, "계정코드": ni_code,
-                    "조정금액": total_pl_impact, "설명": "[손익/재무활동] 미실현이익(NI)", "CF_FS_Element": "1"
-                })
-                # Line 2: RE/PL Entry (-)
-                all_cf_entries.append({
-                    "조정유형": caje_type, "법인": corp_name, "계정코드": pl_acc_code,
-                    "조정금액": total_pl_impact, "설명": "[손익/재무활동] 미실현이익(손익)", "CF_FS_Element": "-1"
+                    "조정금액": -total_pl_impact, "설명": "[비현금손익] 미실현이익(손익)", "원계정_FS_Element": "X"
                 })
             else:
                 grouped = df.groupby(["법인", "계정코드", "설명"])
@@ -944,6 +904,8 @@ with tab3:
                         else: # For 'A' and others
                             cf_adj_amt = -change_amt
                         cf_desc = f"[운전자본] {desc}"
+                    elif caje_type == "CAJE04":
+                        cf_adj_amt, cf_desc = current_amt, f"[손익/재무활동] {desc}"
                     elif caje_type == "CAJE05":
                         cf_adj_amt, cf_desc = current_amt, f"[비현금손익] {desc}"
 
