@@ -1448,7 +1448,7 @@ with tab3:
                             "설명": "전기 미실현이익",
                         },
                         {
-                            "회사명": "자회사A",
+                            "회사명": "모회사",
                             "계정코드": "37500",
                             "계정명": "이익잉여금",
                             "당기전기": "전기",
@@ -1472,7 +1472,7 @@ with tab3:
                             "설명": "당기 판매분 매출원가",
                         },
                         {
-                            "회사명": "모회사",
+                            "회사명": "자회사A",
                             "계정코드": "15200",
                             "계정명": "제품(재고자산)",
                             "당기전기": "당기",
@@ -1500,7 +1500,7 @@ with tab3:
                             "설명": "자회사A 계상 유형자산처분이익",
                         },
                         {
-                            "회사명": "자회사A",
+                            "회사명": "모회사",
                             "계정코드": "37500",
                             "계정명": "이익잉여금",
                             "당기전기": "전기",
@@ -1508,7 +1508,7 @@ with tab3:
                             "설명": "모회사 계상 감가상각비 증분 제거",
                         },
                         {
-                            "회사명": "자회사A",
+                            "회사명": "모회사",
                             "계정코드": "20700",
                             "계정명": "기계장치감가상각누계액",
                             "당기전기": "전기",
@@ -1516,7 +1516,7 @@ with tab3:
                             "설명": "모회사 감가상각누계액",
                         },
                         {
-                            "회사명": "자회사A",
+                            "회사명": "모회사",
                             "계정코드": "81800",
                             "계정명": "감가상각비",
                             "당기전기": "당기",
@@ -1524,7 +1524,7 @@ with tab3:
                             "설명": "모회사 계상 감가상각비 증분 제거",
                         },
                         {
-                            "회사명": "자회사A",
+                            "회사명": "모회사",
                             "계정코드": "20700",
                             "계정명": "기계장치감가상각누계액",
                             "당기전기": "당기",
@@ -1535,8 +1535,8 @@ with tab3:
                     df = pd.DataFrame(example_data)
                 elif sheet_name == "CAJE04_배당조정":
                     example_data = [
-                        {"법인": "모회사", "계정코드": "90300", "계정명": "배당금수익", "당기전기": "당기", "금액": 2000000, "설명": "자회사A로부터 받은 배당금수익 제거"},
-                        {"법인": "자회사A", "계정코드": "37500", "계정명": "이익잉여금", "당기전기": "당기", "금액": -2000000, "설명": "모회사에 지급한 배당금 효과 제거"},
+                        {"회사명": "모회사", "계정코드": "90300", "계정명": "배당금수익", "당기전기": "당기", "금액": 2000000, "설명": "자회사A로부터 받은 배당금수익 제거"},
+                        {"회사명": "자회사A", "계정코드": "37500", "계정명": "이익잉여금", "당기전기": "당기", "금액": -2000000, "설명": "모회사에 지급한 배당금 효과 제거"},
                     ]
                     df = pd.DataFrame(example_data)
                 elif sheet_name == "CAJE96_취득일차이조정":
@@ -1773,9 +1773,19 @@ with tab3:
         name_map = dict(zip(coa_df["계정코드"].astype(str), coa_df["계정명"]))
         tax_adj_entries, nci_adj_entries = [], []
 
-        # Get special account codes from aje_code DataFrame
+        # Get special account codes from aje_code DataFrame and CoA
         NCI_EQUITY_CODE = [key for key, value in fs_map.items() if value == "CE"][0]
-        NCI_PL_CODE = "310000"  # As per existing code
+        
+        # 비지배지분순손익 계정을 CoA에서 'CR' 코드로 동적 탐색
+        nci_pl_row = coa_df[coa_df["FS_Element"] == "CR"]
+        if not nci_pl_row.empty:
+            NCI_PL_CODE = nci_pl_row.iloc[0]["계정코드"]
+            NCI_PL_NAME = nci_pl_row.iloc[0]["계정명"]
+        else:
+            NCI_PL_CODE = "310000"  # Fallback
+            NCI_PL_NAME = "비지배지분순손익"
+            st.warning("CoA 파일에서 'CR' FS_Element를 가진 비지배지분순손익 계정을 찾을 수 없습니다. 기본값('310000')을 사용합니다.")
+
         IT_EXPENSE_CODE = aje_code.loc[aje_code["FS_Element"] == "X", "계정코드"].iloc[0]
         IT_EXPENSE_NAME = aje_code.loc[aje_code["FS_Element"] == "X", "계정명"].iloc[0]
         DTA_CODE = aje_code.loc[aje_code["FS_Element"] == "L", "계정코드"].iloc[0]
@@ -1829,7 +1839,13 @@ with tab3:
 
                 if generate_tax_effect:
                     tax_rate = tax_rates.get(corp, 0.0)
-                    tax_effect = -amount * tax_rate
+                    
+                    # R(수익), X(비용)에서 발생한 조정의 법인세효과 계산 시 부호 변경
+                    if fs_element in ['R', 'X']:
+                        tax_effect = -amount * tax_rate
+                    else: # A(자산)에서 발생한 조정
+                        tax_effect = amount * tax_rate
+
                     if abs(tax_effect) > 1:
                         tax_adj_entries.append(
                             {
@@ -1840,7 +1856,7 @@ with tab3:
                         tax_adj_entries.append(
                             {
                                 "회사명": corp, "계정코드": DTA_CODE, "계정명": DTA_NAME,
-                                "당기전기": "당기", "금액": -tax_effect, "설명": f"{desc} 법인세효과",
+                                "당기전기": "당기", "금액": tax_effect, "설명": f"{desc} 법인세효과",
                             }
                         )
 
@@ -1866,7 +1882,7 @@ with tab3:
                             )
                             nci_adj_entries.append(
                                 {
-                                    "회사명": corp, "계정코드": NCI_PL_CODE, "계정명": "비지배지분순손익",
+                                    "회사명": corp, "계정코드": NCI_PL_CODE, "계정명": NCI_PL_NAME,
                                     "당기전기": "당기", "금액": nci_effect, "설명": f"{desc} 비지배지분효과",
                                 }
                             )
@@ -1902,7 +1918,7 @@ with tab3:
                         ce_adj_code = str(data_row.iloc[2])
                         is_ni_item = "_NI" in ce_adj_code
                         nci_contra_code = NCI_PL_CODE if is_ni_item else nci_equity_code
-                        nci_contra_name = "비지배지분순손익" if is_ni_item else "비지배지분"
+                        nci_contra_name = NCI_PL_NAME if is_ni_item else "비지배지분"
 
                         change_values = pd.to_numeric(
                             data_row.iloc[3:-1], errors="coerce"
