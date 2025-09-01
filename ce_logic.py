@@ -120,7 +120,7 @@ try:
     
     
     # --- 4. 핵심 재배부 로직 및 기록 ---
-    # 4-1. 각 항목별 비지배지분 해당액을 계산 (이전의 amounts_to_subtract와 동일)
+    # 4-1. 각 항목별 비지배지분 해당액을 계산 
     row_sums = df[calculation_cols].sum(axis=1)
     total_nci_per_row = row_sums * nci_percentage
     safe_row_sums = row_sums.replace(0, 1)
@@ -169,12 +169,3 @@ except Exception as e:
     print(f"처리 중 오류가 발생했습니다: {e}")
     
     
-
-
-
-# gemini cli - streamlit_app.py에 다음을 구현해줘.
-# 다음 절차. (순서대로)
-# 1. 여러개의 자본변동표 파일 순회하여 모회사부터 자회사들의 자본변동표 concat 하나의 DF로 나열.
-# 2. 계정코드로 sort
-# 3. 연결조정에서 FS_Element  E항목과 프로그램 내에서 생성된 CE 항목을 가져와서 열이름 해당 코드에 합계금액을 붙여 넣는다. 이름은 연결조정이라고 써 넣는다.
-# 4. 
