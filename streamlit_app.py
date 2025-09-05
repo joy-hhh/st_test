@@ -6,6 +6,10 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.worksheet.datavalidation import DataValidation
 from openpyxl.utils import get_column_letter
 from contextlib import redirect_stdout
+import warnings
+
+# openpyxl의 Data Validation 관련 경고 메시지 무시
+warnings.filterwarnings('ignore', category=UserWarning, module='openpyxl')
 
 st.set_page_config(
     page_title="ConsolLab", page_icon="ConsolLab_logo.png", layout="wide"
@@ -59,6 +63,14 @@ def to_excel(df_dict):
     """
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        # 데이터 유효성 검사 준비
+        validation_formula = None
+        if "Info" in df_dict and not df_dict["Info"].empty:
+            info_df = df_dict["Info"]
+            num_companies = len(info_df)
+            if num_companies > 0:
+                validation_formula = f"='Info'!$A$2:$A${num_companies + 1}"
+
         for sheet_name, df in df_dict.items():
             if df is None:  # df.empty 조건 제거하여 빈 시트도 생성
                 continue
@@ -114,6 +126,23 @@ def to_excel(df_dict):
                             cell.alignment = Alignment(
                                 horizontal="right", vertical="center"
                             )
+            
+            # 데이터 유효성 검사 적용
+            if validation_formula and sheet_name.startswith("CAJE") and "회사명" in df_to_write.columns:
+                dv = DataValidation(
+                    type="list", formula1=validation_formula, allow_blank=True
+                )
+                dv.error = "목록에 있는 값만 입력할 수 있습니다."
+                dv.errorTitle = "잘못된 입력"
+                dv.prompt = "목록에서 회사명을 선택하세요."
+                dv.promptTitle = "회사명 선택"
+                
+                company_col_idx = list(df_to_write.columns).index("회사명") + 1
+                company_col_letter = get_column_letter(company_col_idx)
+                target_range = f"{company_col_letter}2:{company_col_letter}10000"
+                ws.add_data_validation(dv)
+                dv.add(target_range)
+
 
     return output.getvalue()
 
@@ -1823,6 +1852,9 @@ with tab3:
             sheet_name_upper = sheet_name.upper()
             if not sheet_name_upper.startswith("CAJE"):
                 continue
+            
+            if "금액" in df_orig.columns:
+                df_orig["금액"] = pd.to_numeric(df_orig["금액"], errors="coerce").fillna(0)
 
             caje_type = sheet_name_upper.split("_")[0]
             if caje_type in ["CAJE97", "CAJE98"]:
