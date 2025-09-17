@@ -50,16 +50,6 @@ if "fcfs_results" not in st.session_state:
         "summary_df": None,
         "log": [],
     }
-if "adj_workflow" not in st.session_state:
-    st.session_state.adj_workflow = {
-        "initial_file": None,
-        "intermediate_data": None,
-        "final_file": None,
-        "validation_log": [],
-        "carryover_file": None,
-    }
-
-    # --- Session State for Tab 3 ---
 
 
 # =================================================================================================
@@ -187,11 +177,6 @@ def parse_percent(s):
 def log_validation(message):
     """검증 결과를 세션 상태에 기록합니다."""
     st.session_state.results["validation_log"].append(message)
-
-
-def log_adj_validation(message):
-    """연결조정 탭의 검증 결과를 세션 상태에 기록합니다."""
-    st.session_state.adj_workflow["validation_log"].append(message)
 
 
 # =================================================================================================
@@ -481,7 +466,7 @@ with tab1:
                     beg_equity_adjs.loc[:, '금액'] *= -1
                     beginning_adjustments = beg_equity_adjs.groupby('L3_code')['금액'].sum()
 
-        beginning_row = pd.Series(0.0, index=sce_cols, name='기초', dtype='float64')
+        beginning_row = pd.Series(0, index=sce_cols, name='기초')
         beginning_row.update(beginning_simple_sum)
         for code, amount in beginning_adjustments.items():
             if code in l3_codes_map:
@@ -492,7 +477,7 @@ with tab1:
         
         r_adj_sum = merged_bspl_df.loc[merged_bspl_df["FS_Element"] == "R", "연결조정"].sum()
         x_adj_sum = merged_bspl_df.loc[merged_bspl_df["FS_Element"] == "X", "연결조정"].sum()
-        pl_adj_sum = r_adj_sum - x_adj_sum
+        pl_adj_sum = -r_adj_sum - x_adj_sum
         nci_pl_adj = merged_bspl_df.loc[merged_bspl_df["FS_Element"] == "CR", "연결조정"].sum()
         
         ni_adj_row = pd.DataFrame([{'구분': '당기순손익(연결조정)', '이익잉여금': pl_adj_sum - nci_pl_adj, '비지배지분': nci_pl_adj}]).fillna(0)
@@ -500,57 +485,38 @@ with tab1:
         curr_adj_df = full_adj_df[full_adj_df['당기전기'] == '당기'].copy()
         curr_equity_adjs = curr_adj_df[curr_adj_df['FS_Element'].isin(['E', 'CE'])].copy()
         curr_equity_adjs.loc[:, '금액'] *= -1
-        direct_adj_by_code = curr_equity_adjs.groupby('L3_code')['금액'].sum()
         
+        pl_related_codes = merged_bspl_df[merged_bspl_df['FS_Element'].isin(['R', 'X', 'CR'])]['계정코드'].unique()
+        
+        # FS_Element == 'R' 계정이면 금액을 음수로 변환
+        direct_equity_adjs = curr_equity_adjs[~curr_equity_adjs['계정코드'].isin(pl_related_codes)].copy()
+        # direct_equity_adjs.loc[direct_equity_adjs['FS_Element'] == 'R', '금액'] *= -1
+        # 계정코드별 합산
+        direct_adj_by_code = direct_equity_adjs.groupby('L3_code')['금액'].sum()
+        
+
         direct_adj_row_data = {'구분': '기타자본(연결조정)'}
         for code, amount in direct_adj_by_code.items():
             if code in l3_codes_map:
                 direct_adj_row_data[l3_codes_map[code]] = amount
         direct_adj_row = pd.DataFrame([direct_adj_row_data]).fillna(0)
 
-        # 5. 최종 조립 (Refactored to be code-centric)
-        all_sce_rows = []
-
-        # Beginning Balance
-        beg_row_dict = beginning_row.to_dict()
-        beg_row_dict['구분'] = '기초'
-        beg_row_dict['계정코드'] = 'Beginning'
-        all_sce_rows.append(beg_row_dict)
-
-        # Current Changes from CE sheets
-        if not current_changes_df.empty:
-            summed_changes = current_changes_df.groupby(['계정코드', '구분'])[sce_cols].sum().reset_index()
-            all_sce_rows.extend(summed_changes.to_dict('records'))
-
-        # Net Income Adjustment
-        ni_adj_row.loc[0, '계정코드'] = 'CE1001_NI'
-        all_sce_rows.extend(ni_adj_row.to_dict('records'))
-
-        # Other Direct Adjustments
+        # 5. 최종 조립
+        beg_sce = pd.DataFrame([beginning_row])
+        final_sce = pd.concat([beg_sce, current_changes_df.groupby('구분')[sce_cols].sum()], ignore_index=False)
+        final_sce = pd.concat([final_sce, ni_adj_row.set_index('구분')], ignore_index=False)
         if not direct_adj_row.empty and direct_adj_row.drop(columns=['구분']).iloc[0].abs().sum() > 1:
-            direct_adj_row.loc[0, '계정코드'] = 'CE1002_CAJE'
-            all_sce_rows.extend(direct_adj_row.to_dict('records'))
+             final_sce = pd.concat([final_sce, direct_adj_row.set_index('구분')], ignore_index=False)
 
-        final_sce = pd.DataFrame(all_sce_rows)
-        
-        final_sce = final_sce.fillna(0)
-        ordered_cols = ['구분', '계정코드'] + sce_cols
-        final_sce = final_sce[ordered_cols]
-
-        final_sce = final_sce.loc[(final_sce[sce_cols].abs().sum(axis=1)) > 1].reset_index(drop=True)
-
-        # Calculate Ending Balance
-        ending_row_data = final_sce[sce_cols].sum().to_dict()
-        ending_row_data['구분'] = '기말'
-        ending_row_data['계정코드'] = 'Ending'
-        ending_row_df = pd.DataFrame([ending_row_data])
-        final_sce = pd.concat([final_sce, ending_row_df], ignore_index=True)
+        final_sce = final_sce.loc[(final_sce[sce_cols].abs().sum(axis=1)) > 1].fillna(0)
+        final_sce.loc['기말', sce_cols] = final_sce[sce_cols].sum()
 
         # 6. 검증 행 추가
         l3_map = dict(zip(coa_df['계정코드'], coa_df['L3_code']))
         if 'L3_code' not in merged_bspl_df.columns:
              merged_bspl_df['L3_code'] = merged_bspl_df['계정코드'].map(l3_map)
 
+        # For CE elements (NCI), if L3_code is null, use the account code itself.
         is_ce = merged_bspl_df['FS_Element'] == 'CE'
         is_l3_missing = merged_bspl_df['L3_code'].isna()
         merged_bspl_df.loc[is_ce & is_l3_missing, 'L3_code'] = merged_bspl_df.loc[is_ce & is_l3_missing, '계정코드']
@@ -560,23 +526,16 @@ with tab1:
         verification_row = pd.Series(index=sce_cols, name="검증(연결BS)")
         for col, code in col_to_l3_map.items():
             verification_row[col] = l3_totals.get(code, 0)
+        final_sce.loc['검증(연결BS)'] = verification_row
+
+        final_sce = final_sce.reset_index().rename(columns={'index': '구분'})
         
-        verification_row_data = verification_row.to_dict()
-        verification_row_data['구분'] = '검증(연결BS)'
-        verification_row_data['계정코드'] = 'Verification'
-        verification_row_df = pd.DataFrame([verification_row_data])
-        final_sce = pd.concat([final_sce, verification_row_df], ignore_index=True)
-        
-        # 계정코드로 정렬. '기초', '기말', '검증' 행의 순서는 유지.
-        is_special = final_sce['계정코드'].isin(['Beginning', 'Ending', 'Verification'])
-        data_rows = final_sce[~is_special].sort_values(by='계정코드')
-        
-        final_sce = pd.concat([
-            final_sce[final_sce['계정코드'] == 'Beginning'],
-            data_rows,
-            final_sce[final_sce['계정코드'] == 'Ending'],
-            final_sce[final_sce['계정코드'] == 'Verification'],
-        ], ignore_index=True)
+        # '구분'에 중복이 있을 수 있으므로, 첫 번째 '계정코드'를 사용하도록 중복을 제거하여 map을 생성
+        temp_map_df = combined_ce_df[['구분', '계정코드']].dropna(subset=['구분']).drop_duplicates(subset=['구분'])
+        row_to_code_map = pd.Series(temp_map_df.계정코드.values, index=temp_map_df.구분).to_dict()
+
+        row_to_code_map.update({'기초': 'Beginning', '기말': 'Ending', '검증(연결BS)': 'Verification', '당기순손익(연결조정)': 'CE11_NI', '기타자본(연결조정)': 'CE12_CAJE'})
+        final_sce.insert(1, '조정코드', final_sce['구분'].map(row_to_code_map).fillna('CE9999'))
         
         return final_sce
 
@@ -1402,6 +1361,12 @@ with tab3:
     )
 
     # --- Session State for Tab 3 ---
+    if "adj_workflow" not in st.session_state:
+        st.session_state.adj_workflow = {
+            "initial_file": None,
+            "intermediate_data": None,
+            "final_file": None,
+        }
 
     @st.cache_data
     def create_adjustment_template():
@@ -2268,7 +2233,7 @@ with tab3:
                                 )
 
                 else:
-                    log_adj_validation(f"⚠️ **[{sub_name}]** 자본변동표(CE) 시트가 없어 자본변동에 따른 비지배지분 조정을 계산할 수 없습니다.")
+                    log_validation(f"⚠️ **[{sub_name}]** 자본변동표(CE) 시트가 없어 자본변동에 따른 비지배지분 조정을 계산할 수 없습니다.")
             except Exception as e:
                 st.warning(f"{sub_name}의 'CE'시트 처리 중 오류: {e}")
 
@@ -2337,11 +2302,11 @@ with tab3:
             and st.session_state.files.get("coa")
         ),
     ):
-        st.session_state.adj_workflow["validation_log"] = []  # 로그 초기화
+        st.session_state.results["validation_log"] = []  # 로그 초기화
 
         subs_files = st.session_state.files.get("subsidiaries", [])
         if not subs_files:
-            log_adj_validation(
+            log_validation(
                 "⚠️ **[자회사 파일 없음]** 자회사 재무제표 파일이 업로드되지 않으면 자본변동에 따른 비지배지분 조정을 계산할 수 없습니다."
             )
 
@@ -2372,13 +2337,9 @@ with tab3:
                 st.error(f"자동계산 중 오류 발생: {e}")
                 st.exception(e)
 
-    if "validation_log" not in st.session_state.adj_workflow:
-        st.session_state.adj_workflow["validation_log"] = []
-    if "validation_log" not in st.session_state.adj_workflow:
-        st.session_state.adj_workflow["validation_log"] = []
-    if st.session_state.adj_workflow["validation_log"]:
+    if st.session_state.results["validation_log"]:
         with st.expander("🔍 조정 자동계산 검증 로그", expanded=True):
-            for log in st.session_state.adj_workflow["validation_log"]:
+            for log in st.session_state.results["validation_log"]:
                 st.markdown(log, unsafe_allow_html=True)
 
     if st.session_state.adj_workflow.get("intermediate_data"):
@@ -3159,7 +3120,8 @@ with tab3:
         "당기 조정명세 파일을 업로드하면, 차기에 반영될 전기누적 조정명세를 생성합니다."
     )
 
-    
+    if 'adj_workflow' not in st.session_state:
+        st.session_state.adj_workflow = {}
 
     carryover_adj_file = st.file_uploader(
         "차기이월 할 조정명세 파일을 업로드하세요.",

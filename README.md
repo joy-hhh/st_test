@@ -1,6 +1,7 @@
 # ConsolLab 연결봇
 
-연결봇 ConsolLab은 
+연결봇 ConsolLab은 연결재무제표 작성에 필요한 엑셀 작업을 돕는 프로그램입니다.
+연결 재무제표, 주석 합산 및 대사, 
 
 ## Development Log
 
